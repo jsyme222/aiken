@@ -532,6 +532,8 @@ where
     ) -> Result<(), Error> {
         let processing_sequence = parsed_modules.sequence()?;
 
+        let mut fn_aliases = HashMap::new();
+
         for name in processing_sequence {
             if let Some(ParsedModule {
                 name,
@@ -589,8 +591,16 @@ where
 
                 checked_module.attach_doc_and_module_comments();
 
+                fn_aliases.extend(checked_module.ast.find_function_aliases());
+
                 self.checked_modules.insert(name, checked_module);
             }
+        }
+
+        for (_, checked_module) in self.checked_modules.iter_mut() {
+            println!("{:#?}\n", checked_module.ast);
+            checked_module.ast.simplify(&fn_aliases);
+            println!("{:#?}\n", checked_module.ast);
         }
 
         Ok(())

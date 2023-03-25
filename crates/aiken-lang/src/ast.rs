@@ -2,11 +2,11 @@ use crate::{
     builtins::{self, bool},
     expr::{TypedExpr, UntypedExpr},
     parser::token::Token,
-    tipo::{PatternConstructor, Type, TypeInfo},
+    tipo::{PatternConstructor, Type, TypeInfo, ValueConstructor, ValueConstructorVariant},
 };
 use miette::Diagnostic;
 use owo_colors::{OwoColorize, Stream::Stdout};
-use std::{fmt, ops::Range, sync::Arc};
+use std::{collections::HashMap, fmt, ops::Range, sync::Arc};
 use vec1::Vec1;
 
 pub const ASSERT_VARIABLE: &str = "_try";
@@ -69,11 +69,295 @@ impl UntypedModule {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct FnAlias {
+    // The adjusted function body that this function maps to. This corresponds to the
+    // inner function body which can subsitute when calling the function, modulo arguments
+    // remapping.
+    pub alias: Box<TypedExpr>,
+
+    // Wrapper-functions may define arguments in a different order and with different labels.
+    // For example:
+    //
+    // ```aiken
+    // pub fn push(self: ByteArray, byte: Int) -> ByteArray {
+    //   builtin.cons_bytearray(byte, self)
+    // }
+    // ```
+    //
+    // Yet, we know from the function definition how to remap any given argument list.
+    // This is what this field captures. The `u8` index indicates to what position
+    // should an argument be remapped. Arguments are defined in the same order as they
+    // are defined in the wrapper function.
+    //
+    // So, in the example above, we obtain:
+    //
+    //     [(1, "byte"), (0, "self")]
+    //
+    // Argument labels are necessary in case where they're used at call-site. Otherwise, we
+    // rely on positional order of both vectors (call vs 'args_remapping').
+    pub args_remapping: Vec<(usize, ArgName)>,
+}
+
+type FnAliasKey = (String, String); // (module's name, function's name)
+
 impl TypedModule {
     pub fn find_node(&self, byte_index: usize) -> Option<Located<'_>> {
         self.definitions
             .iter()
             .find_map(|definition| definition.find_node(byte_index))
+    }
+
+    pub fn find_function_aliases(&self) -> HashMap<FnAliasKey, FnAlias> {
+        /// Remap arguments.
+        /// This only works for now when the call args are plain variables.
+        ///
+        /// Anything else collapses into 'None' for now and isn't considered "an alias".
+        ///
+        /// TODO: In a second time, we could potentially remap simple expressions as well.
+        fn remap_arguments(
+            args: &[TypedArg],
+            call_args: &[TypedCallArg],
+        ) -> Option<Vec<(usize, ArgName)>> {
+            let mut mapped_args = vec![];
+
+            for call_arg in call_args.iter() {
+                match call_arg.value {
+                    TypedExpr::Var {
+                        ref name,
+                        constructor:
+                            ValueConstructor {
+                                variant: ValueConstructorVariant::LocalVariable { .. },
+                                ..
+                            },
+                        ..
+                    } => match call_arg.label {
+                        None => mapped_args.append(
+                            &mut args
+                                .iter()
+                                .enumerate()
+                                .filter_map(|(i, Arg { arg_name, .. })| {
+                                    if name == &arg_name.get_label() {
+                                        Some((i, arg_name.clone()))
+                                    } else {
+                                        None
+                                    }
+                                })
+                                .collect::<Vec<_>>(),
+                        ),
+
+                        Some(ref label) => mapped_args.append(
+                            &mut args
+                                .iter()
+                                .enumerate()
+                                .filter_map(|(i, Arg { arg_name, .. })| {
+                                    if arg_name.get_label() == *label {
+                                        Some((i, arg_name.clone()))
+                                    } else {
+                                        None
+                                    }
+                                })
+                                .collect::<Vec<_>>(),
+                        ),
+                    },
+                    _ => return None,
+                }
+            }
+
+            Some(mapped_args)
+        }
+
+        let mut aliases = HashMap::new();
+        for def in self.definitions.iter() {
+            if let Definition::Fn(Function {
+                arguments,
+                body:
+                    TypedExpr::Call {
+                        fun,
+                        args: call_arguments,
+                        ..
+                    },
+                name,
+                location,
+                ..
+            }) = def
+            {
+                if arguments.is_empty() {
+                    continue;
+                }
+
+                // TODO: Also work from `Var` defined from the module itself.
+                if let TypedExpr::ModuleSelect {
+                    tipo,
+                    label,
+                    module_name,
+                    module_alias,
+                    constructor,
+                    ..
+                } = fun.as_ref()
+                {
+                    let alias = Box::new(TypedExpr::ModuleSelect {
+                        location: *location,
+                        tipo: tipo.clone(),
+                        label: label.clone(),
+                        module_name: module_name.clone(),
+                        module_alias: module_alias.clone(),
+                        constructor: constructor.clone(),
+                    });
+
+                    if let Some(args_remapping) = remap_arguments(arguments, call_arguments) {
+                        aliases.insert(
+                            (self.name.clone(), name.clone()),
+                            FnAlias {
+                                alias,
+                                args_remapping,
+                            },
+                        );
+                    }
+                }
+            }
+        }
+        aliases
+    }
+
+    /// Replace calls to function aliases by their aliased functions.
+    ///
+    /// For example, this transforms the following code:
+    ///
+    /// ```aiken
+    /// pub fn push(self: ByteArray, byte: Int) -> ByteArray {
+    ///   builtin.cons_bytearray(byte, self)
+    /// }
+    ///
+    /// pub fn main() {
+    ///   ""
+    ///     |> push(1)
+    ///     |> push(2)
+    /// }
+    /// ```
+    ///
+    /// into:
+    ///
+    /// ```aiken
+    /// pub fn main() {
+    ///   ""
+    ///     |> builtin.cons_bytearray(1, _)
+    ///     |> builtin.cons_bytearray(2, _)
+    /// }
+    /// ```
+    pub fn simplify(&mut self, aliases: &HashMap<FnAliasKey, FnAlias>) {
+        fn get_function_identifier(expr: &TypedExpr) -> Option<(&str, &str)> {
+            use crate::expr::TypedExpr::*;
+
+            match expr {
+                ModuleSelect {
+                    module_name, label, ..
+                } => Some((module_name, label)),
+                Var {
+                    constructor:
+                        ValueConstructor {
+                            variant: ValueConstructorVariant::ModuleFn { module, name, .. },
+                            ..
+                        },
+                    ..
+                } => Some((module, name)),
+                _ => None,
+            }
+        }
+
+        fn simplify_expr(expr: &mut TypedExpr, aliases: &HashMap<FnAliasKey, FnAlias>) {
+            use crate::expr::TypedExpr::*;
+
+            match expr {
+                Call { ref mut fun, args, .. } => {
+                    if let Some((module, fun_name)) = get_function_identifier(fun) {
+                        if let Some(FnAlias { alias, args_remapping }) = aliases.get(&(module.to_string(), fun_name.to_string())) {
+                            *fun = alias.clone();
+
+                            let mut args_remapped = vec![];
+
+                            for (i, arg) in args_remapping {
+                                for (j, call_arg) in args.iter().enumerate() {
+                                    if Some(arg.get_label()) == call_arg.label || *i == j {
+                                        args_remapped.push(CallArg {
+                                            label: None,
+                                            location: call_arg.location,
+                                            value: call_arg.value.clone()
+                                        });
+                                    }
+                                }
+                            }
+
+                            *args = args_remapped;
+                        }
+                    }
+                }
+                Sequence { ref mut expressions, .. }
+                | Pipeline { ref mut expressions, .. }
+                | List { elements: ref mut expressions, .. }
+                | Tuple { elems: ref mut expressions, .. }
+                => {
+                    for expr in expressions {
+                        simplify_expr(expr, aliases);
+                    }
+                }
+                Fn { body: ref mut expr, .. }
+                | Assignment { value: ref mut expr, .. }
+                | Trace { then: ref mut expr, .. }
+                | UnOp { value: ref mut expr, .. }
+                => {
+                    simplify_expr(expr, aliases);
+                }
+                BinOp { ref mut left, ref mut right, .. } => {
+                    simplify_expr(left, aliases);
+                    simplify_expr(right, aliases);
+                }
+                If {
+                    // ref mut branches,
+                    // ref mut final_else,
+                    ..
+                } => {
+                    ()
+                    // todo!()
+                }
+                When {
+                    ..
+                } => {
+                    ()
+                    // todo!()
+                }
+                Int {..}
+                | String {..}
+                | ByteArray {..}
+                | Var{..}
+                | RecordAccess{..}
+                | ModuleSelect{..}
+                | ErrorTerm {..}
+                | TupleIndex {..}
+                | RecordUpdate{..} => {}
+            }
+        }
+
+        for def in self.definitions.iter_mut() {
+            match def {
+                Definition::Fn(Function { ref mut body, .. })
+                | Definition::Test(Function { ref mut body, .. }) => simplify_expr(body, aliases),
+                Definition::Validator(Validator {
+                    ref mut fun,
+                    ref mut other_fun,
+                    ..
+                }) => {
+                    simplify_expr(&mut fun.body, aliases);
+                    if let Some(other_fun) = other_fun {
+                        simplify_expr(&mut other_fun.body, aliases);
+                    }
+                }
+                Definition::TypeAlias { .. }
+                | Definition::DataType { .. }
+                | Definition::ModuleConstant { .. }
+                | Definition::Use { .. } => {}
+            }
+        }
     }
 
     pub fn validate_module_name(&self) -> Result<(), Error> {

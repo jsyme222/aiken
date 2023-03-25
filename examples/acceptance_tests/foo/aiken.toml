@@ -1,0 +1,9 @@
+name = "examples/foo"
+version = "0.0.0"
+license = "Apache-2.0"
+description = "Aiken contracts for project 'examples/foo'"
+
+[repository]
+user = "examples"
+project = "foo"
+platform = "github"
